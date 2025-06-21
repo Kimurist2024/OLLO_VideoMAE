@@ -1,0 +1,735 @@
+# ruff: noqa: E402
+
+import collections
+import sys
+import time
+import argparse
+import os
+import json
+
+import cv2
+import numpy as np
+import torch
+import torch.backends.cudnn as cudnn
+from tqdm import tqdm
+from torchvision import transforms as torch_transforms
+
+from models import test_net
+from inference_utils import input_maker, detector, data_writer
+
+# 追加
+import decord
+from decord import VideoReader
+
+import sys
+sys.path.append('/home/ollo/VideoMAE')
+
+import modeling_finetune
+import video_transforms as video_transforms
+import volume_transforms as volume_transforms
+
+# Factory-specific class mappings
+FACTORY_CLASS_MAPPING = {
+    0: "pick_up_component", 1: "place_component", 2: "assembly_action", 3: "hand_reaching", 
+    4: "hand_positioning", 5: "component_handling", 6: "precision_work", 7: "tool_usage",
+    8: "quality_check", 9: "movement_transition", 10: "idle_state", 11: "grasping",
+    12: "releasing", 13: "rotating_component", 14: "aligning_parts", 15: "pressing_down",
+    16: "connecting_parts", 17: "testing_function", 18: "cleaning_surface", 19: "measuring_dimension",
+    20: "adjusting_position"
+}
+
+# Extend the mapping to cover all classes up to 58
+for i in range(21, 58):
+    FACTORY_CLASS_MAPPING[i] = f"factory_action_{i}"
+
+def apply_factory_preprocessing(img, crop_hands=True, enhance_contrast=True):
+    """Apply factory-specific preprocessing optimizations"""
+    if img is None:
+        return img
+        
+    if crop_hands:
+        h, w = img.shape[:2]
+        # Focus on center-bottom area where most hand work happens
+        h_start = max(0, int(h * 0.15))  # Start from 15% down
+        h_end = min(h, int(h * 0.95))    # End at 95% down  
+        w_start = max(0, int(w * 0.05))  # Start from 5% right
+        w_end = min(w, int(w * 0.95))    # End at 95% right
+        img = img[h_start:h_end, w_start:w_end]
+    
+    if enhance_contrast:
+        # Enhance contrast for better hand detection in factory lighting
+        img = cv2.convertScaleAbs(img, alpha=1.2, beta=10)
+    
+    return img
+
+class FactoryOptimizedPreprocessor(input_maker.Preprocessor):
+    """Factory-optimized version of the Preprocessor class"""
+    
+    def __init__(self, *args, crop_hands=True, enhance_contrast=True, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.crop_hands = crop_hands
+        self.enhance_contrast = enhance_contrast
+    
+    def _update_image(self, orig_img, crop_area_bbox: list, frame: int, timestamp: int, is_last: bool):
+        time_info = {}
+        
+        if crop_area_bbox is None:
+            pass
+        else:
+            crop_x1, crop_y1, crop_x2, crop_y2 = crop_area_bbox
+            orig_img = orig_img[crop_y1:crop_y2, crop_x1:crop_x2]
+
+        if self.centercrop and orig_img is not None:
+            orig_img_h, orig_img_w = orig_img.shape[:2]
+            crop_x1 = (orig_img_w - orig_img_h) // 2
+            crop_x2 = crop_x1 + orig_img_h
+            orig_img = orig_img[:, crop_x1:crop_x2]
+
+        if self.img_w is None and self.img_h is None:
+            if is_last:
+                raise NotImplementedError("error")
+            self.img_h, self.img_w, _ = orig_img.shape
+
+        if is_last:
+            transformed_img = self.latest_image_list[-1]
+            frame = self.latest_frame_list[-1]
+            timestamp = self.latest_timestamp_list[-1]
+        else:
+            # Apply factory-specific preprocessing
+            orig_img = apply_factory_preprocessing(orig_img, self.crop_hands, self.enhance_contrast)
+            
+            orig_img = cv2.cvtColor(orig_img, cv2.COLOR_BGR2RGB)
+            orig_img = cv2.resize(orig_img, self.resize_img_wh)
+
+            transform_st = time.perf_counter()
+            
+            transpose_st = time.perf_counter()
+            orig_img = orig_img.transpose(2, 0, 1)
+            transpose_time = time.perf_counter() - transpose_st
+            time_info["transpose_time"] = transpose_time
+
+            div_st = time.perf_counter()
+            transformed_img = orig_img.astype(np.float32) / 255.0
+            div_time = time.perf_counter() - div_st
+            time_info["div_time"] = div_time
+
+            sub_div_st = time.perf_counter()
+            for i in range(transformed_img.shape[0]):
+                transformed_img[i] -= self.mean_array[i]
+                transformed_img[i] *= self.std_multiple_array[i]
+            sub_div_time = time.perf_counter() - sub_div_st
+            time_info["sub_div_time"] = sub_div_time
+
+            transform_time = time.perf_counter() - transform_st
+            time_info["transform_time"] = transform_time
+
+        self.latest_image_list.append(transformed_img)
+        self.latest_frame_list.append(frame)
+        self.latest_timestamp_list.append(timestamp)
+
+        model_name2x_tensor_list = {}
+        pid = -100
+        batch_info_list = []
+
+        start_preprocess = time.perf_counter()
+        if len(self.latest_image_list) >= self.window_size:
+            insert_st = time.perf_counter()
+            for i, img in enumerate(self.latest_image_list[-self.window_size :]):
+                self.preallocated_buffer[i] = img
+            insert_time = time.perf_counter() - insert_st
+            time_info["insert_time"] = insert_time
+
+            transpose_window_st = time.perf_counter()
+            input_images = self.preallocated_buffer.copy().transpose(1, 0, 2, 3)
+            transpose_window_time = time.perf_counter() - transpose_window_st
+            time_info["transpose_window_time"] = transpose_window_time
+
+            model_name2x_tensor_list["main"] = [input_images]
+
+            insert_frame_list = self.latest_frame_list[-self.window_size :]
+            insert_timestamp_list = self.latest_timestamp_list[-self.window_size :]
+
+            batch_info_list.append({
+                "pid": pid,
+                "frame_list": insert_frame_list,
+                "timestamp_list": insert_timestamp_list,
+            })
+
+            self.latest_image_list = self.latest_image_list[self.slide_size :]
+            self.latest_frame_list = self.latest_frame_list[self.slide_size :]
+            self.latest_timestamp_list = self.latest_timestamp_list[self.slide_size :]
+
+        preprocess_time = time.perf_counter() - start_preprocess
+        time_info["prepare_preprocess_time"] = preprocess_time
+
+        return (model_name2x_tensor_list, batch_info_list, [], time_info)
+
+def analyze_and_save_factory_results(all_output_results, output_dir, video_name, args):
+    """Analyze results and save factory-specific analysis"""
+    analysis = {
+        'dominant_actions': [],
+        'workflow_stages': [],
+        'activity_summary': {}
+    }
+    
+    print(f"Analyzing {len(all_output_results)} output results...")
+    
+    # Process output results
+    for result in all_output_results:
+        features = result['features']
+        frame_list = result['frame_list']
+        timestamp_list = result.get('timestamp_list', [])
+        
+        # Apply sigmoid to get probabilities if needed
+        if isinstance(features, np.ndarray):
+            if features.max() > 1.0:  # Assume logits if values > 1
+                features = 1 / (1 + np.exp(-features))  # Sigmoid
+        
+        # Process each frame
+        if len(features.shape) == 2:  # (time, num_classes)
+            for i, feature in enumerate(features):
+                if i < len(frame_list):
+                    dominant_class = np.argmax(feature)
+                    confidence = feature[dominant_class]
+                    action_name = FACTORY_CLASS_MAPPING.get(dominant_class, f"unknown_{dominant_class}")
+                    
+                    if confidence > 0.3:  # Confidence threshold
+                        analysis['dominant_actions'].append({
+                            'frame': frame_list[i],
+                            'timestamp': timestamp_list[i] if i < len(timestamp_list) else 0.0,
+                            'action': action_name,
+                            'class_id': dominant_class,
+                            'confidence': confidence
+                        })
+        elif len(features.shape) == 1:  # Single prediction for entire window
+            dominant_class = np.argmax(features)
+            confidence = features[dominant_class]
+            action_name = FACTORY_CLASS_MAPPING.get(dominant_class, f"unknown_{dominant_class}")
+            
+            if confidence > 0.3:
+                analysis['dominant_actions'].append({
+                    'frame_range': frame_list,
+                    'timestamp_range': timestamp_list,
+                    'action': action_name,
+                    'class_id': dominant_class,
+                    'confidence': confidence
+                })
+    
+    # Create workflow stages
+    if analysis['dominant_actions']:
+        analysis['dominant_actions'].sort(key=lambda x: x.get('timestamp', x.get('frame', 0)))
+        
+        current_stage = {
+            'action': analysis['dominant_actions'][0]['action'],
+            'start_time': analysis['dominant_actions'][0].get('timestamp', 0),
+            'frames': [],
+            'confidences': []
+        }
+        
+        for action_info in analysis['dominant_actions']:
+            if action_info['action'] == current_stage['action']:
+                if 'frame' in action_info:
+                    current_stage['frames'].append(action_info['frame'])
+                current_stage['confidences'].append(action_info['confidence'])
+            else:
+                # Finalize current stage
+                current_stage['duration_frames'] = len(current_stage['frames'])
+                current_stage['avg_confidence'] = np.mean(current_stage['confidences'])
+                analysis['workflow_stages'].append(current_stage.copy())
+                
+                # Start new stage
+                current_stage = {
+                    'action': action_info['action'],
+                    'start_time': action_info.get('timestamp', 0),
+                    'frames': [action_info.get('frame', 0)] if 'frame' in action_info else [],
+                    'confidences': [action_info['confidence']]
+                }
+        
+        # Add final stage
+        if current_stage['frames']:
+            current_stage['duration_frames'] = len(current_stage['frames'])
+            current_stage['avg_confidence'] = np.mean(current_stage['confidences'])
+            analysis['workflow_stages'].append(current_stage)
+    
+    # Activity summary
+    if analysis['dominant_actions']:
+        actions = [action['action'] for action in analysis['dominant_actions']]
+        unique_actions = list(set(actions))
+        
+        analysis['activity_summary'] = {
+            'total_detected_actions': len(analysis['dominant_actions']),
+            'unique_actions_count': len(unique_actions),
+            'unique_actions': unique_actions,
+            'action_frequencies': {action: actions.count(action) for action in unique_actions},
+            'most_frequent_action': max(unique_actions, key=lambda x: actions.count(x)) if unique_actions else 'none',
+            'avg_confidence': np.mean([action['confidence'] for action in analysis['dominant_actions']]),
+            'high_confidence_actions': len([a for a in analysis['dominant_actions'] if a['confidence'] > 0.7])
+        }
+    
+    # Save factory analysis results
+    factory_results = {
+        'video_name': video_name,
+        'analysis_config': {
+            'window_size': args.window_size,
+            'input_size': args.input_size,
+            'num_classes': args.num_classes,
+            'analysis_fps': args.analysis_fps,
+            'checkpoint_path': args.checkpoint_path,
+            'model_architecture': 'modeling_finetune'
+        },
+        'factory_analysis': analysis,
+        'class_mapping': FACTORY_CLASS_MAPPING,
+        'workflow_summary': {
+            'num_workflow_stages': len(analysis['workflow_stages']),
+            'total_actions_detected': analysis['activity_summary'].get('total_detected_actions', 0),
+            'unique_actions_detected': analysis['activity_summary'].get('unique_actions_count', 0),
+            'most_frequent_action': analysis['activity_summary'].get('most_frequent_action', 'none'),
+            'avg_confidence': analysis['activity_summary'].get('avg_confidence', 0.0),
+            'high_confidence_actions': analysis['activity_summary'].get('high_confidence_actions', 0)
+        }
+    }
+    
+    # Serialize output results for JSON
+    serializable_outputs = []
+    for result in all_output_results:
+        serializable_result = {}
+        for key, value in result.items():
+            if isinstance(value, np.ndarray):
+                serializable_result[key] = value.tolist()
+            else:
+                serializable_result[key] = value
+        serializable_outputs.append(serializable_result)
+    
+    factory_results['raw_outputs'] = serializable_outputs
+    
+    output_file = os.path.join(output_dir, f'{video_name}_factory_analysis.json')
+    with open(output_file, 'w') as f:
+        json.dump(factory_results, f, indent=2)
+    
+    print(f"Factory analysis saved to: {output_file}")
+    return factory_results
+
+def get_args():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--video_path", type=str, required=True, help="可視化したい動画ファイル")
+    parser.add_argument("--output_dir", type=str, required=True, help="model の予測結果を保存するディレクトリ")
+    parser.add_argument("--checkpoint_path", type=str, required=True, help="読み込むモデルチェックポイントのパス")
+    parser.add_argument("--analysis_fps", type=int, required=True, help="動画の分析のfps (例: 10)")
+    parser.add_argument("--inference_batch_size", type=int, required=True, help="推論のバッチサイズ")
+    parser.add_argument("--window_size", type=int, required=True, help="model 学習時の model の windowsize")
+    parser.add_argument("--input_size", type=int, required=True, help="model 学習時の model の input size")
+    parser.add_argument("--num_classes", type=int, required=True, help="model 学習時の model の num_classes")
+    parser.add_argument("--tubelet_size", type=int, required=True, help="model 学習時の model の tubelet_size")
+    
+    # Factory-specific options
+    parser.add_argument("--crop_hands", action='store_true', default=True, help="Focus on hand workspace region")
+    parser.add_argument("--enhance_contrast", action='store_true', default=True, help="Enhance contrast for factory lighting")
+
+    return parser.parse_args()
+
+
+def main(args, logger=None):
+    start = time.time()
+    if logger is None:
+        print_ = print
+    else:
+        print_ = logger.info
+
+    msg = "####### FACTORY EXTRACT FEATURE #######"
+    print_("#" * len(msg))
+    print_(msg)
+    print_("#" * len(msg))
+
+    #################################
+    #################################
+    start_frame = 0
+    end_frame = 10000000
+
+    ####### decord で学習した場合はdecord に書き換える ##########
+    # GPUを使用したい場合は以下のコメントを解除
+    decord.bridge.set_bridge('torch')
+    read_cap = VideoReader(args.video_path)
+    ########################################################
+
+    # cv2の場合
+    # fps = int(round(read_cap.get(cv2.CAP_PROP_FPS)))
+    # total_frame_num = int(read_cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    # decordの場合
+    fps = int(round(read_cap.get_avg_fps()))
+    total_frame_num = len(read_cap)
+
+    end_frame = min(end_frame, total_frame_num)
+
+    if end_frame == -1:
+        end_frame = total_frame_num
+
+    # os.environ["CUDA_VISIBLE_DEVICES"] = CUDA_DEVICES
+
+    cudnn.benchmark = True
+
+    # 短すぎる動画に対してskip_lengthが大きいと推論できないため短い場合は1にする
+    # 1 ~ 100 frame の範囲の動画を推論するときに、window_size = 16 として
+    # [1 ~ 16], [1 + slide_size ~ 16 + slide_size], [1 + 2 * slide_size ~ 16 + 2 * slide_size], ...
+    # というように、slide_size ずつずらして推論する
+    # [1 ~ 16] の画像16枚を 1 ~ 16 frame の予測値として採用するので
+    # model の output (1, num_classes) を (window_size, num_classes) に拡張する必要がある
+    # skip length は推論を analysis_fps に対して何フレームに1回分のデータにするのかを指定する
+    # analysis_fps = 10 で skip_lenght = 2 とすると
+    # [0.1, 0.3, 0.5, ..., 3.1] 秒での画像で input を作成して推論する
+
+    if total_frame_num > 1000:
+        skip_length = 1
+        slide_size = 2
+    else:
+        skip_length = 1
+        slide_size = 1
+
+    # transform = torch_transforms.Compose(
+    #     [
+    #         torch_transforms.ToPILImage(),
+    #         # torch_transforms.Grayscale(num_output_channels=3),
+    #         torch_transforms.ToTensor(),
+    #         torch_transforms.Normalize(
+    #             mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+    #         ),
+    #     ]
+    # )
+
+    # custom.pyからvalidation時のtransformを実装
+    transform = video_transforms.Compose([
+                video_transforms.Resize(256, interpolation='bilinear'),
+                video_transforms.CenterCrop(size=(args.input_size, args.input_size)),
+                volume_transforms.ToFloatTensorInZeroOne(),
+                video_transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                           std=[0.229, 0.224, 0.225])
+            ])
+
+    model_name2data_transform = {
+        "main": transform,
+    }
+
+    # Use factory-optimized preprocessor
+    input_preprocessor = FactoryOptimizedPreprocessor(
+        logger=logger,
+        model_name2data_transform=model_name2data_transform,
+        analysis_img_wh=(args.input_size, args.input_size),
+        window_size=args.window_size,
+        skipper=skip_length,
+        slide_size=slide_size,
+        is_keep_aspratio=False,
+        resize_img_wh=(args.input_size, args.input_size),
+        centercrop=False,
+        crop_hands=args.crop_hands,
+        enhance_contrast=args.enhance_contrast,
+    )
+
+    ###### ここを書き換える ######
+    # モデルの初期化
+    model = modeling_finetune.vit_base_patch16_224(
+        all_frames=args.window_size,
+        img_size=args.input_size,
+        num_classes=args.num_classes,
+        tubelet_size=args.tubelet_size,
+        use_checkpoint=True
+    )
+    
+    # チェックポイントの読み込み
+    checkpoint_path = args.checkpoint_path
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    state_dict = checkpoint
+    
+    # head層も含めてすべての重みを読み込む
+    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+    
+    if logger:
+        logger.info(f"Model weights loaded from {checkpoint_path}")
+        logger.info(f"Missing keys: {missing_keys}")
+        logger.info(f"Unexpected keys: {unexpected_keys}")
+    else:
+        print(f"Model weights loaded from {checkpoint_path}")
+        print(f"Missing keys: {missing_keys}")
+        print(f"Unexpected keys: {unexpected_keys}")
+    #################################
+    #################################
+
+    model_detector = detector.Detector(
+        logger=logger,
+        model_name2model={
+            "main": model,
+        },
+        model_name2device_id={
+            "main": 0,
+        },
+        inference_batch_size=args.inference_batch_size,
+        use_trt_model=False,
+        input_data=None,
+    )
+
+    output_dir = args.output_dir
+    analysis_fps = args.analysis_fps
+
+    video_fps = fps
+
+    data_write_monitor = data_writer.DataWriter(
+        save_dir=output_dir,
+        analysis_fps=analysis_fps,
+        video_fps=video_fps,
+        save_freq_second=900,
+        logger=logger,
+        is_generate_video_meta_data=True
+    )
+
+    analysis_frame_set = set()
+    all_output_results = []  # Store all results for factory analysis
+
+    print_(f"start frame = {start_frame}, end frame = {end_frame}")
+    print_(f"Factory optimizations: crop_hands={args.crop_hands}, enhance_contrast={args.enhance_contrast}")
+
+    time_info_history = collections.defaultdict(list)
+
+    progress_bar = tqdm(total=end_frame - start_frame + 1)
+    prev_video_index = 0
+    next_send_progress_percentage = 0
+    progress_freq_percentage = 10
+    iter_st = time.time()
+
+    video_analysis_skipper = int(round(video_fps / analysis_fps))
+
+    first_analysis_frame = 0
+    now_timestamp = 0.0
+
+    for fi in range(start_frame, end_frame + 1):
+        # cv2の場合
+        # grabbed, img = read_cap.read()
+        # if not grabbed:
+        #     break
+
+        # decordの場合
+        try:
+            img = read_cap[fi].numpy()  # NumPy配列に変換
+        except (IndexError, decord.DECORDError):
+            break
+
+        video_frame = fi
+
+        diff_frame = fi - prev_video_index
+        progress_bar.update(diff_frame)
+
+        prev_video_index = fi
+
+        now_timestamp += 1 / fps
+        is_infer = fi == end_frame
+
+        analysis_frame = video_frame // video_analysis_skipper
+
+        if not is_infer:
+            if (analysis_frame - first_analysis_frame) % skip_length != 0:
+                continue
+
+        if analysis_frame in analysis_frame_set:
+            continue
+
+        analysis_frame_set.add(analysis_frame)
+
+        preprocess_st = time.time()
+        (
+            model_name2x_tensor_list,
+            batch_info_list,
+            pop_pid_list,
+            time_info,
+        ) = input_preprocessor.update(
+            orig_img=img,
+            crop_area_bbox=None,
+            frame=analysis_frame,
+            timestamp=now_timestamp,
+            is_last=is_infer,
+        )
+        preprocess_time = time.time() - preprocess_st
+        time_info["preprocess_time"] = preprocess_time
+
+        # logger.info(time_info)
+        # if len(batch_info_list):
+        # print(batch_info_list[0]["frame_list"])
+        #     x_tensor = model_name2x_tensor_list["main"][0]
+        #     print(x_tensor[0, :3, :3, :3])
+
+        # for batch_info in batch_info_list:
+        # frame_list = batch_info["frame_list"]
+        # print(batch_info["pid"], frame_list[0], frame_list[-1], len(frame_list))
+
+        # if len(batch_info_list):
+        #     print(time_info)
+        # print(len(model_name2x_tensor_list["main"]))
+
+        model_forward_st = time.time()
+        output_result = model_detector.update(
+            detected_model_name2x_tensor_list=model_name2x_tensor_list,
+            detected_batch_info_list=batch_info_list,
+            is_last=False,
+            now_video_frame=fi,
+            now_timestamp=now_timestamp,
+        )
+        
+        # Store results for factory analysis
+        all_output_results.extend(output_result)
+        
+        # for output_info in output_result:
+        #     print(output_info["frame_list"])
+        #     print(output_info["features"][:3])
+        model_forward_time = time.time() - model_forward_st
+        time_info["model_forward_time"] = model_forward_time
+
+        write_st = time.time()
+        data_write_monitor.update(
+            output_result_list=output_result,
+            now_analysis_frame=analysis_frame,
+            now_video_frame=fi,
+            now_timestamp=now_timestamp,
+            image=img,
+        )
+        write_duration = time.time() - write_st
+        time_info["write_duration"] = write_duration
+
+        duration = time.time() - iter_st
+        time_info["iteration_duration"] = duration
+        iter_st = time.time()
+
+        # if len(model_name2x_tensor_list):
+        #     print("b=",  video_model_detector.inference_batch_size, time_info)
+
+        for key, value in time_info.items():
+            time_info_history[key].append(value)
+
+        # if fi >= 1000:
+        #     break
+
+    progress_bar.close()
+
+    time_info_summary = {}
+    for key, value in time_info_history.items():
+        mean = np.mean(value)
+        sum = np.sum(value)
+
+        time_info_summary[key] = {"mean": mean, "sum": sum}
+
+    print_(f"time_info_summary: {time_info_summary}")
+
+    # import pprint
+    # pprint.pprint(time_info_summary)
+
+    # 動画の最後の数フレームがframe_numのせいで推論されない。
+    # その分を最後の画像をコピーすることで対応
+    # 例えば 0 ~ 255 までのフレームがあって、window_size=16だと
+    # 最後のバッチが 240 ~ 255になり、240フレーム目までしか存在しなくなる。
+    # 241 ~ 255の分を作成する
+
+    last_update_generator = input_preprocessor.last_update(
+        inference_length=args.window_size
+    )
+    for last_output in last_update_generator:
+        (
+            model_name2x_tensor_list,
+            batch_info_list,
+            pop_pid_list,
+            time_info,
+            fi,
+        ) = last_output
+
+        video_frame = end_frame + fi * skip_length + 1
+
+        # print("video frame=", video_frame)
+        # print("batch_info_list:")
+        # for batch_info in batch_info_list:
+        #     print(batch_info)
+
+        if len(model_name2x_tensor_list):
+            output_result = model_detector.update(
+                detected_model_name2x_tensor_list=model_name2x_tensor_list,
+                detected_batch_info_list=batch_info_list,
+                now_video_frame=video_frame,
+                is_last=False,
+            )
+            all_output_results.extend(output_result)
+
+        else:
+            output_result = []
+
+        data_write_monitor.update(
+            output_result_list=output_result,
+            now_analysis_frame=analysis_frame,
+            now_video_frame=video_frame,
+            image=None,
+        )
+
+        now_timestamp = video_frame / fps
+
+    output_result = model_detector.update(
+        model_name="main",
+        is_last=True,
+        detected_model_name2x_tensor_list={},
+        detected_batch_info_list=[],
+        now_video_frame=video_frame,
+    )
+
+    all_output_results.extend(output_result)
+
+    data_write_monitor.update(
+        output_result_list=output_result,
+        now_analysis_frame=analysis_frame,
+        now_video_frame=video_frame,
+        image=None,
+    )
+    data_write_monitor.process_one_save_batch(
+        now_video_frame=video_frame, now_timestamp=now_timestamp
+    )
+
+    # Factory-specific analysis and saving
+    video_name = os.path.splitext(os.path.basename(args.video_path))[0]
+    factory_results = analyze_and_save_factory_results(all_output_results, output_dir, video_name, args)
+
+    total_time = time.time() - start
+    print_(f"total_time: {total_time:.2f} sec")
+    
+    # Print factory analysis summary
+    summary = factory_results['workflow_summary']
+    print_(f"\n" + "="*60)
+    print_(f"FACTORY ANALYSIS SUMMARY")
+    print_(f"="*60)
+    print_(f"Video: {video_name}")
+    print_(f"Total actions detected: {summary['total_actions_detected']}")
+    print_(f"Unique actions: {summary['unique_actions_detected']}")
+    print_(f"Workflow stages: {summary['num_workflow_stages']}")
+    print_(f"High confidence actions: {summary['high_confidence_actions']}")
+    print_(f"Average confidence: {summary['avg_confidence']:.3f}")
+    print_(f"Most frequent action: {summary['most_frequent_action']}")
+    print_(f"="*60)
+
+
+if __name__ == "__main__":
+    # opts = get_args()
+    args = get_args()
+    """
+    Factory usage example:
+    poetry run python3 factory_extract_feature1.py \
+        --video_path /home/ollo/Ollo_video/factory_video.mp4 \
+        --output_dir ./data/pose_data/factory_analysis \
+        --checkpoint_path ./checkpoints/videomae_finetuned_interactive.pth \
+        --analysis_fps 10 \
+        --inference_batch_size 8 \
+        --window_size 16 \
+        --input_size 224 \
+        --num_classes 58 \
+        --tubelet_size 2 \
+        --crop_hands \
+        --enhance_contrast
+    """
+
+    logger = None
+    # try:
+        # main_async(args, logger=logger)
+    main(args, logger=logger)
+    # except Exception as e:
+    #     logger.error(e, exc_info=True)
+    #     sys.exit(1)

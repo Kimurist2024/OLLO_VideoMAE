@@ -1,0 +1,38 @@
+[tool.poetry]
+name = "internscripts"
+version = "0.1.0"
+description = ""
+authors = ["Your Name <you@example.com>"]
+readme = "README.md"
+
+
+[tool.poetry.dependencies]
+python = "3.11.3"
+timm = "0.4.12"
+einops = "^0.6.1"
+decord = "^0.6.0"
+opencv-python = "^4.8.0.74"
+tqdm = "^4.66.3"
+scipy = "^1.11.1"
+easydict = "^1.10"
+imgaug = "^0.4.0"
+pyyaml = "^6.0"
+albumentations = "^1.3.1"
+regex = "^2023.10.3"
+torch = {version = "2.3.1", source = "torch_cu118"}
+torchvision = {version = "0.18.1", source = "torch_cu118"}
+setuptools = "^78.1.1"
+wandb = "^0.19.6"
+nptyping = "^2.5.0"
+ipykernel = "^6.29.5"
+pandas = "^2.2.3"
+
+
+[[tool.poetry.source]]
+name = "torch_cu118"
+url = "https://download.pytorch.org/whl/cu118"
+priority = "explicit"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
